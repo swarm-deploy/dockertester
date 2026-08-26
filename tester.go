@@ -13,6 +13,7 @@ type Tester struct {
 	network *NetworkTester
 	volume  *VolumeTester
 	secret  *SecretTester
+	swarm   *SwarmTester
 }
 
 func NewTester() (*Tester, error) {
@@ -27,9 +28,30 @@ func NewTester() (*Tester, error) {
 		network: NewNetworkTester(client),
 		volume:  NewVolumeTester(client),
 		secret:  NewSecretTester(client),
+		swarm:   NewSwarmTester(client),
 	}, nil
 }
 
 func (t *Tester) Service() *ServiceTester {
 	return t.service
+}
+
+func (t *Tester) Network() *NetworkTester {
+	return t.network
+}
+
+func (t *Tester) Volume() *VolumeTester {
+	return t.volume
+}
+
+func (t *Tester) Secret() *SecretTester {
+	return t.secret
+}
+
+func (t *Tester) Swarm() *SwarmTester {
+	return t.swarm
+}
+
+func (t *Tester) Close() error {
+	return t.client.Close()
 }

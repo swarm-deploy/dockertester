@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/swarm"
 	dock "github.com/moby/moby/client"
 	"github.com/stretchr/testify/require"
@@ -53,6 +54,15 @@ func (st *SecretTester) CreateSecret(ctx context.Context, path string, value []b
 	}
 
 	return created.ID, nil
+}
+
+func (st *SecretTester) Delete(ctx context.Context, name string) error {
+	_, err := st.client.SecretRemove(ctx, name, dock.SecretRemoveOptions{})
+	if err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("delete secret %q: %w", name, err)
+	}
+
+	return nil
 }
 
 func (st *SecretTester) ListSecrets(ctx context.Context, logicalPath string) ([]swarm.Secret, error) {

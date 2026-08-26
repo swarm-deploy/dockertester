@@ -58,6 +58,19 @@ func (st *ServiceTester) WaitHealthy(ctx context.Context, serviceID string) erro
 	}
 }
 
+func (st *ServiceTester) Delete(ctx context.Context, serviceID string) error {
+	_, err := st.client.ServiceRemove(ctx, serviceID, dock.ServiceRemoveOptions{})
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil
+		}
+
+		return fmt.Errorf("delete service %q: %w", serviceID, err)
+	}
+
+	return nil
+}
+
 func (st *ServiceTester) Healthy(ctx context.Context, serviceID string) (bool, string, error) {
 	service, err := st.client.ServiceInspect(ctx, serviceID, dock.ServiceInspectOptions{})
 	if err != nil {
