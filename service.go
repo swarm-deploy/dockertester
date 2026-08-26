@@ -71,6 +71,14 @@ func (st *ServiceTester) Delete(ctx context.Context, serviceID string) error {
 	return nil
 }
 
+func (st *ServiceTester) DeleteAndWait(ctx context.Context, serviceID string) error {
+	if err := st.Delete(ctx, serviceID); err != nil {
+		return err
+	}
+
+	return st.WaitRemoved(ctx, serviceID)
+}
+
 func (st *ServiceTester) Healthy(ctx context.Context, serviceID string) (bool, string, error) {
 	service, err := st.client.ServiceInspect(ctx, serviceID, dock.ServiceInspectOptions{})
 	if err != nil {
