@@ -2,6 +2,7 @@ package dockertester
 
 import (
 	"fmt"
+	"testing"
 
 	dock "github.com/moby/moby/client"
 )
@@ -30,6 +31,15 @@ func NewTester() (*Tester, error) {
 		secret:  NewSecretTester(client),
 		swarm:   NewSwarmTester(client),
 	}, nil
+}
+
+func MustNewTester(t *testing.T) *Tester {
+	tester, err := NewTester()
+	if err != nil {
+		t.Fatalf("create docker tester: %v", err)
+	}
+
+	return tester
 }
 
 func (t *Tester) Service() *ServiceTester {
