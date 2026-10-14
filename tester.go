@@ -15,6 +15,7 @@ type Tester struct {
 	volume  *VolumeTester
 	secret  *SecretTester
 	swarm   *SwarmTester
+	stack   *StackTester
 }
 
 func NewTester() (*Tester, error) {
@@ -23,6 +24,10 @@ func NewTester() (*Tester, error) {
 		return nil, fmt.Errorf("create docker client: %w", err)
 	}
 
+	return newTester(client), nil
+}
+
+func newTester(client dock.APIClient) *Tester {
 	return &Tester{
 		client:  client,
 		service: NewServiceTester(client),
@@ -30,14 +35,22 @@ func NewTester() (*Tester, error) {
 		volume:  NewVolumeTester(client),
 		secret:  NewSecretTester(client),
 		swarm:   NewSwarmTester(client),
-	}, nil
+		stack:   NewStackTester(client),
+	}
 }
 
 func MustNewTester(t *testing.T) *Tester {
+	t.Helper()
+
 	tester, err := NewTester()
 	if err != nil {
 		t.Fatalf("create docker tester: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := tester.Close(); err != nil {
+			t.Errorf("close docker tester: %v", err)
+		}
+	})
 
 	return tester
 }
@@ -60,6 +73,10 @@ func (t *Tester) Secret() *SecretTester {
 
 func (t *Tester) Swarm() *SwarmTester {
 	return t.swarm
+}
+
+func (t *Tester) Stack() *StackTester {
+	return t.stack
 }
 
 func (t *Tester) Close() error {
