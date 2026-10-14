@@ -3,6 +3,7 @@ package dockertester
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -11,7 +12,7 @@ import (
 	dock "github.com/moby/moby/client"
 )
 
-const waitServiceHealthyTimeout = 15 * time.Second
+const waitPollInterval = 500 * time.Millisecond
 
 type ServiceTester struct {
 	client dock.APIClient
@@ -33,10 +34,26 @@ func (st *ServiceTester) Deploy(ctx context.Context, spec swarm.ServiceSpec) (st
 }
 
 func (st *ServiceTester) WaitHealthy(ctx context.Context, serviceID string) error {
-	ctx, cancel := context.WithTimeout(ctx, waitServiceHealthyTimeout)
+	return st.waitHealthy(ctx, serviceID)
+}
+
+func (st *ServiceTester) WaitHealthyTimeout(
+	ctx context.Context,
+	serviceID string,
+	timeout time.Duration,
+) error {
+	if timeout <= 0 {
+		return fmt.Errorf("wait service %q healthy: timeout must be positive", serviceID)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	ticker := time.NewTicker(500 * time.Millisecond)
+	return st.waitHealthy(waitCtx, serviceID)
+}
+
+func (st *ServiceTester) waitHealthy(ctx context.Context, serviceID string) error {
+	ticker := time.NewTicker(waitPollInterval)
 	defer ticker.Stop()
 
 	var lastStatus string
@@ -92,16 +109,27 @@ func (st *ServiceTester) Healthy(ctx context.Context, serviceID string) (bool, s
 		return false, "", fmt.Errorf("list tasks for service %q: %w", serviceID, err)
 	}
 
-	expectedState := swarm.TaskStateRunning
-	if st.isCompletionService(service.Service.Spec) {
-		expectedState = swarm.TaskStateComplete
-	}
-
-	var healthy int
+	completionService := st.isCompletionService(service.Service.Spec)
+	desired := st.desiredTasks(service.Service)
+	healthy := 0
 	statuses := make([]string, 0, len(tasks.Items))
 	for _, task := range tasks.Items {
-		statuses = append(statuses, fmt.Sprintf("%s:%s:%s", task.ID, task.Status.State, task.Status.Err))
+		current := st.isCurrentTask(service.Service, task)
+		statuses = append(statuses, fmt.Sprintf(
+			"%s:state=%s:desired=%s:current=%t:error=%s",
+			task.ID,
+			task.Status.State,
+			task.DesiredState,
+			current,
+			task.Status.Err,
+		))
+		if !current {
+			continue
+		}
 
+		if !completionService && task.DesiredState != swarm.TaskStateRunning {
+			continue
+		}
 		if task.Status.State == swarm.TaskStateRejected || task.Status.State == swarm.TaskStateFailed {
 			return false, strings.Join(statuses, ", "), fmt.Errorf(
 				"service %q task %q failed: state=%s err=%s",
@@ -111,21 +139,33 @@ func (st *ServiceTester) Healthy(ctx context.Context, serviceID string) (bool, s
 				task.Status.Err,
 			)
 		}
-		if task.Status.State == expectedState {
+		if completionService && task.Status.State == swarm.TaskStateComplete {
+			healthy++
+		}
+		if !completionService && task.Status.State == swarm.TaskStateRunning {
 			healthy++
 		}
 	}
 
-	desired := st.desiredTasks(service.Service.Spec)
 	if healthy >= desired {
 		return true, strings.Join(statuses, ", "), nil
 	}
 
-	return false, strings.Join(statuses, ", "), nil
+	taskStatuses := strings.Join(statuses, ", ")
+	if taskStatuses == "" {
+		taskStatuses = "none"
+	}
+
+	return false, fmt.Sprintf(
+		"healthy tasks: %d/%d; tasks: %s",
+		healthy,
+		desired,
+		taskStatuses,
+	), nil
 }
 
 func (st *ServiceTester) WaitRemoved(ctx context.Context, serviceID string) error {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(waitPollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -146,7 +186,8 @@ func (st *ServiceTester) WaitRemoved(ctx context.Context, serviceID string) erro
 	}
 }
 
-func (*ServiceTester) desiredTasks(spec swarm.ServiceSpec) int {
+func (*ServiceTester) desiredTasks(service swarm.Service) int {
+	spec := service.Spec
 	if spec.Mode.Replicated != nil && spec.Mode.Replicated.Replicas != nil {
 		return int(*spec.Mode.Replicated.Replicas)
 	}
@@ -158,8 +199,19 @@ func (*ServiceTester) desiredTasks(spec swarm.ServiceSpec) int {
 			return int(*spec.Mode.ReplicatedJob.MaxConcurrent)
 		}
 	}
+	if service.ServiceStatus != nil {
+		return int(service.ServiceStatus.DesiredTasks)
+	}
 
 	return 1
+}
+
+func (*ServiceTester) isCurrentTask(service swarm.Service, task swarm.Task) bool {
+	if service.JobStatus != nil {
+		return task.JobIteration != nil && task.JobIteration.Index == service.JobStatus.JobIteration.Index
+	}
+
+	return reflect.DeepEqual(task.Spec, service.Spec.TaskTemplate)
 }
 
 func (*ServiceTester) isCompletionService(spec swarm.ServiceSpec) bool {
