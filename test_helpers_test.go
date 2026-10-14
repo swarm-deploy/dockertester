@@ -38,13 +38,17 @@ func (f *fakeDockerClient) TaskList(
 }
 
 func serviceWithTasks(spec swarm.ServiceSpec, tasks []swarm.Task) *fakeDockerClient {
+	return serviceClient(swarm.Service{Spec: spec}, tasks)
+}
+
+func serviceClient(service swarm.Service, tasks []swarm.Task) *fakeDockerClient {
 	return &fakeDockerClient{
 		serviceInspect: func(
 			context.Context,
 			string,
 			dock.ServiceInspectOptions,
 		) (dock.ServiceInspectResult, error) {
-			return dock.ServiceInspectResult{Service: swarm.Service{Spec: spec}}, nil
+			return dock.ServiceInspectResult{Service: service}, nil
 		},
 		taskList: func(context.Context, dock.TaskListOptions) (dock.TaskListResult, error) {
 			return dock.TaskListResult{Items: tasks}, nil

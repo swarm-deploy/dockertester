@@ -2,6 +2,7 @@ package dockertester
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -10,66 +11,142 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestServiceHealthyIgnoresHistoricalFailedTasks(t *testing.T) {
-	spec := replicatedSpec(1, 2)
-	oldSpec := spec.TaskTemplate
-	oldSpec.ForceUpdate = 1
+func TestServiceHealthyAcceptsNormalizedTaskSpec(t *testing.T) {
+	createdAt := time.Now()
+	spec := replicatedSpec(1, 0)
+	spec.TaskTemplate.ContainerSpec = &swarm.ContainerSpec{Image: "nginx:latest"}
+	normalizedSpec := spec.TaskTemplate
+	normalizedSpec.ContainerSpec = &swarm.ContainerSpec{Image: "nginx:latest@sha256:digest"}
 	client := serviceWithTasks(spec, []swarm.Task{
-		{
-			ID:           "old-failed",
-			Spec:         oldSpec,
-			DesiredState: swarm.TaskStateShutdown,
-			Status:       swarm.TaskStatus{State: swarm.TaskStateFailed, Err: "old failure"},
-		},
-		currentTask("current", spec.TaskTemplate, swarm.TaskStateRunning),
+		serviceTask("current", 1, createdAt, normalizedSpec, swarm.TaskStateRunning),
 	})
 
-	healthy, status, err := NewServiceTester(client).Healthy(context.Background(), "service")
+	healthy, _, err := NewServiceTester(client).Healthy(context.Background(), "service")
 	require.NoError(t, err)
 	require.True(t, healthy)
-	require.Contains(t, status, "old-failed")
-	require.Contains(t, status, "current=false")
 }
 
 func TestServiceHealthyDuringRollingUpdate(t *testing.T) {
+	startedAt := time.Now()
 	spec := replicatedSpec(2, 2)
+	service := swarm.Service{
+		Spec: spec,
+		UpdateStatus: &swarm.UpdateStatus{
+			State:     swarm.UpdateStateUpdating,
+			StartedAt: &startedAt,
+			Message:   "update in progress",
+		},
+	}
 	oldSpec := spec.TaskTemplate
 	oldSpec.ForceUpdate = 1
-	updatingTasks := []swarm.Task{
-		currentTask("old-one", oldSpec, swarm.TaskStateRunning),
-		currentTask("old-two", oldSpec, swarm.TaskStateRunning),
-		currentTask("new-one", spec.TaskTemplate, swarm.TaskStateRunning),
+	tasks := []swarm.Task{
+		serviceTask("old-one", 1, startedAt.Add(-time.Minute), oldSpec, swarm.TaskStateRunning),
+		serviceTask("old-two", 2, startedAt.Add(-time.Minute), oldSpec, swarm.TaskStateRunning),
+		serviceTask("new-one", 1, startedAt.Add(time.Second), spec.TaskTemplate, swarm.TaskStateRunning),
 	}
-	client := serviceWithTasks(spec, updatingTasks)
+	client := serviceClient(service, tasks)
 
 	healthy, status, err := NewServiceTester(client).Healthy(context.Background(), "service")
 	require.NoError(t, err)
 	require.False(t, healthy)
 	require.Contains(t, status, "healthy tasks: 1/2")
+	require.Contains(t, status, "old-one:state=running:desired=running:current=false")
 
-	calls := 0
-	client.taskList = func(context.Context, dock.TaskListOptions) (dock.TaskListResult, error) {
-		calls++
-		if calls == 1 {
-			return dock.TaskListResult{Items: updatingTasks}, nil
-		}
+	service.UpdateStatus.State = swarm.UpdateStateCompleted
+	service.UpdateStatus.Message = "update completed"
+	tasks = append(tasks,
+		serviceTask("new-two", 2, startedAt.Add(2*time.Second), spec.TaskTemplate, swarm.TaskStateRunning),
+	)
+	client = serviceClient(service, tasks)
+	healthy, _, err = NewServiceTester(client).Healthy(context.Background(), "service")
+	require.NoError(t, err)
+	require.True(t, healthy)
+}
 
-		return dock.TaskListResult{Items: []swarm.Task{
-			currentTask("new-one", spec.TaskTemplate, swarm.TaskStateRunning),
-			currentTask("new-two", spec.TaskTemplate, swarm.TaskStateRunning),
-		}}, nil
+func TestServiceWaitHealthyRecoversFromTransientTaskFailure(t *testing.T) {
+	for _, failedState := range []swarm.TaskState{swarm.TaskStateFailed, swarm.TaskStateRejected} {
+		t.Run(string(failedState), func(t *testing.T) {
+			createdAt := time.Now()
+			spec := replicatedSpec(1, 1)
+			failed := serviceTask("failed", 1, createdAt, spec.TaskTemplate, failedState)
+			failed.Status.Err = "temporary failure"
+			replacement := serviceTask(
+				"replacement",
+				1,
+				createdAt.Add(time.Second),
+				spec.TaskTemplate,
+				swarm.TaskStateRunning,
+			)
+			client := serviceWithTasks(spec, nil)
+			calls := 0
+			client.taskList = func(context.Context, dock.TaskListOptions) (dock.TaskListResult, error) {
+				calls++
+				if calls == 1 {
+					return dock.TaskListResult{Items: []swarm.Task{failed}}, nil
+				}
+
+				return dock.TaskListResult{Items: []swarm.Task{failed, replacement}}, nil
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			require.NoError(t, NewServiceTester(client).WaitHealthy(ctx, "service"))
+			require.GreaterOrEqual(t, calls, 2)
+		})
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	require.NoError(t, NewServiceTester(client).WaitHealthy(ctx, "service"))
-	require.GreaterOrEqual(t, calls, 2)
+}
+
+func TestServiceWaitHealthyPersistentFailureTimesOutWithDiagnostics(t *testing.T) {
+	createdAt := time.Now()
+	spec := replicatedSpec(1, 1)
+	failed := serviceTask("failed", 1, createdAt, spec.TaskTemplate, swarm.TaskStateFailed)
+	failed.Status.Err = "image pull failed"
+	oldHealthy := serviceTask(
+		"old-healthy",
+		1,
+		createdAt.Add(-time.Second),
+		spec.TaskTemplate,
+		swarm.TaskStateRunning,
+	)
+	client := serviceWithTasks(spec, []swarm.Task{oldHealthy, failed})
+
+	err := NewServiceTester(client).WaitHealthyTimeout(context.Background(), "service", time.Millisecond)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorContains(t, err, "state=failed")
+	require.ErrorContains(t, err, "image pull failed")
+}
+
+func TestServiceWaitHealthyHonorsContextCancellation(t *testing.T) {
+	createdAt := time.Now()
+	spec := replicatedSpec(1, 1)
+	client := serviceWithTasks(spec, []swarm.Task{
+		serviceTask("pending", 1, createdAt, spec.TaskTemplate, swarm.TaskStatePending),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := NewServiceTester(client).WaitHealthy(ctx, "service")
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorContains(t, err, "state=pending")
+}
+
+func TestServiceWaitHealthyReturnsDockerAPIErrors(t *testing.T) {
+	dockerErr := errors.New("daemon unavailable")
+	client := serviceWithTasks(replicatedSpec(1, 1), nil)
+	client.taskList = func(context.Context, dock.TaskListOptions) (dock.TaskListResult, error) {
+		return dock.TaskListResult{}, dockerErr
+	}
+
+	err := NewServiceTester(client).WaitHealthy(context.Background(), "service")
+	require.ErrorIs(t, err, dockerErr)
 }
 
 func TestServiceHealthyVerifiesReplicaCount(t *testing.T) {
+	createdAt := time.Now()
 	spec := replicatedSpec(3, 1)
 	client := serviceWithTasks(spec, []swarm.Task{
-		currentTask("one", spec.TaskTemplate, swarm.TaskStateRunning),
-		currentTask("two", spec.TaskTemplate, swarm.TaskStateRunning),
+		serviceTask("one", 1, createdAt, spec.TaskTemplate, swarm.TaskStateRunning),
+		serviceTask("two", 2, createdAt, spec.TaskTemplate, swarm.TaskStateRunning),
 	})
 
 	healthy, status, err := NewServiceTester(client).Healthy(context.Background(), "service")
@@ -95,29 +172,13 @@ func TestServiceHealthyReplicatedJobUsesCurrentIteration(t *testing.T) {
 		jobTask("complete-one", spec.TaskTemplate, 2, swarm.TaskStateComplete),
 		jobTask("complete-two", spec.TaskTemplate, 2, swarm.TaskStateComplete),
 	}
-	client := serviceWithTasks(spec, tasks)
-	client.serviceInspect = func(
-		context.Context,
-		string,
-		dock.ServiceInspectOptions,
-	) (dock.ServiceInspectResult, error) {
-		return dock.ServiceInspectResult{Service: service}, nil
-	}
+	client := serviceClient(service, tasks)
 
 	healthy, status, err := NewServiceTester(client).Healthy(context.Background(), "job")
 	require.NoError(t, err)
 	require.True(t, healthy)
 	require.Contains(t, status, "old-failed")
 	require.Contains(t, status, "current=false")
-}
-
-func TestServiceWaitHealthyTimeout(t *testing.T) {
-	spec := replicatedSpec(1, 1)
-	client := serviceWithTasks(spec, nil)
-
-	err := NewServiceTester(client).WaitHealthyTimeout(context.Background(), "service", time.Millisecond)
-	require.ErrorIs(t, err, context.DeadlineExceeded)
-	require.ErrorContains(t, err, "healthy tasks: 0/1")
 }
 
 func replicatedSpec(replicas, forceUpdate uint64) swarm.ServiceSpec {
@@ -129,10 +190,18 @@ func replicatedSpec(replicas, forceUpdate uint64) swarm.ServiceSpec {
 	}
 }
 
-func currentTask(id string, spec swarm.TaskSpec, state swarm.TaskState) swarm.Task {
+func serviceTask(
+	id string,
+	slot int,
+	createdAt time.Time,
+	spec swarm.TaskSpec,
+	state swarm.TaskState,
+) swarm.Task {
 	return swarm.Task{
 		ID:           id,
+		Meta:         swarm.Meta{CreatedAt: createdAt},
 		Spec:         spec,
+		Slot:         slot,
 		DesiredState: swarm.TaskStateRunning,
 		Status:       swarm.TaskStatus{State: state},
 	}

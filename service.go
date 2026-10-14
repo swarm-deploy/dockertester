@@ -3,7 +3,7 @@ package dockertester
 import (
 	"context"
 	"fmt"
-	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -111,10 +111,11 @@ func (st *ServiceTester) Healthy(ctx context.Context, serviceID string) (bool, s
 
 	completionService := st.isCompletionService(service.Service.Spec)
 	desired := st.desiredTasks(service.Service)
+	currentTasks := st.currentTasks(service.Service, tasks.Items)
 	healthy := 0
 	statuses := make([]string, 0, len(tasks.Items))
 	for _, task := range tasks.Items {
-		current := st.isCurrentTask(service.Service, task)
+		_, current := currentTasks[task.ID]
 		statuses = append(statuses, fmt.Sprintf(
 			"%s:state=%s:desired=%s:current=%t:error=%s",
 			task.ID,
@@ -130,15 +131,6 @@ func (st *ServiceTester) Healthy(ctx context.Context, serviceID string) (bool, s
 		if !completionService && task.DesiredState != swarm.TaskStateRunning {
 			continue
 		}
-		if task.Status.State == swarm.TaskStateRejected || task.Status.State == swarm.TaskStateFailed {
-			return false, strings.Join(statuses, ", "), fmt.Errorf(
-				"service %q task %q failed: state=%s err=%s",
-				service.Service.Spec.Name,
-				task.ID,
-				task.Status.State,
-				task.Status.Err,
-			)
-		}
 		if completionService && task.Status.State == swarm.TaskStateComplete {
 			healthy++
 		}
@@ -147,7 +139,8 @@ func (st *ServiceTester) Healthy(ctx context.Context, serviceID string) (bool, s
 		}
 	}
 
-	if healthy >= desired {
+	updateComplete := st.updateComplete(service.Service.UpdateStatus)
+	if healthy >= desired && updateComplete {
 		return true, strings.Join(statuses, ", "), nil
 	}
 
@@ -157,9 +150,10 @@ func (st *ServiceTester) Healthy(ctx context.Context, serviceID string) (bool, s
 	}
 
 	return false, fmt.Sprintf(
-		"healthy tasks: %d/%d; tasks: %s",
+		"healthy tasks: %d/%d; update: %s; tasks: %s",
 		healthy,
 		desired,
+		formatUpdateStatus(service.Service.UpdateStatus),
 		taskStatuses,
 	), nil
 }
@@ -206,12 +200,75 @@ func (*ServiceTester) desiredTasks(service swarm.Service) int {
 	return 1
 }
 
-func (*ServiceTester) isCurrentTask(service swarm.Service, task swarm.Task) bool {
+func (st *ServiceTester) currentTasks(service swarm.Service, tasks []swarm.Task) map[string]struct{} {
+	current := make(map[string]struct{})
+	// JobIteration is the generation marker exposed by the Docker API for jobs.
 	if service.JobStatus != nil {
-		return task.JobIteration != nil && task.JobIteration.Index == service.JobStatus.JobIteration.Index
+		for _, task := range tasks {
+			if task.JobIteration != nil && task.JobIteration.Index == service.JobStatus.JobIteration.Index {
+				current[task.ID] = struct{}{}
+			}
+		}
+
+		return current
 	}
 
-	return reflect.DeepEqual(task.Spec, service.Spec.TaskTemplate)
+	// Docker's public Task type does not expose SwarmKit's SpecVersion. Use the
+	// update start as the generation boundary, then retain only the newest task
+	// for each orchestration slot so restarted and replaced tasks supersede their
+	// predecessors without comparing normalized task specifications.
+	latestBySlot := make(map[string]swarm.Task)
+	for _, task := range tasks {
+		if service.UpdateStatus != nil && service.UpdateStatus.StartedAt != nil &&
+			task.CreatedAt.Before(*service.UpdateStatus.StartedAt) {
+			continue
+		}
+
+		slot := st.taskSlot(service.Spec, task)
+		latest, found := latestBySlot[slot]
+		if !found || task.CreatedAt.After(latest.CreatedAt) ||
+			(task.CreatedAt.Equal(latest.CreatedAt) && task.ID > latest.ID) {
+			latestBySlot[slot] = task
+		}
+	}
+
+	for _, task := range latestBySlot {
+		current[task.ID] = struct{}{}
+	}
+
+	return current
+}
+
+func (*ServiceTester) taskSlot(spec swarm.ServiceSpec, task swarm.Task) string {
+	if spec.Mode.Global != nil {
+		if task.NodeID == "" {
+			return "task:" + task.ID
+		}
+
+		return "node:" + task.NodeID
+	}
+
+	return "slot:" + strconv.Itoa(task.Slot)
+}
+
+func (*ServiceTester) updateComplete(status *swarm.UpdateStatus) bool {
+	if status == nil {
+		return true
+	}
+
+	return status.State == swarm.UpdateStateCompleted || status.State == swarm.UpdateStateRollbackCompleted
+}
+
+func formatUpdateStatus(status *swarm.UpdateStatus) string {
+	if status == nil {
+		return "none"
+	}
+
+	if status.Message == "" {
+		return string(status.State)
+	}
+
+	return fmt.Sprintf("%s (%s)", status.State, status.Message)
 }
 
 func (*ServiceTester) isCompletionService(spec swarm.ServiceSpec) bool {
